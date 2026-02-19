@@ -20,7 +20,7 @@ class LLMService:
     async def generate(
         self,
         messages: List[Dict[str, str]],
-        model: str = "llama3-70b-8192", # Groq model default
+        model: str = None,
         provider: str = "groq",
         temperature: float = 0.7,
         stream: bool = False,
@@ -31,11 +31,15 @@ class LLMService:
         Returns message object (non-stream) or async generator of chunks (stream).
         """
         try:
+            if model is None or model == "default":
+                if provider == "groq":
+                    model = "llama3-70b-8192"
+                elif provider == "deepseek":
+                    model = "deepseek-chat"
+
             client = self.groq_client
             if provider == "deepseek":
                 client = self.deepseek_client
-                if model == "default":
-                    model = "deepseek-chat"
 
             tool_choice = "auto" if tools else None
 

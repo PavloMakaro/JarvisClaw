@@ -52,6 +52,10 @@ Minimze steps. If you can answer directly, do so.
                 stream=False
             )
 
+            if isinstance(response, str):
+                print(f"Decision failed due to LLM error: {response}")
+                return {"decision": "RESPOND_DIRECTLY", "reasoning": f"LLM Error: {response}"}
+
             content = response.content
             # Clean up markdown code blocks if present
             if "```json" in content:
