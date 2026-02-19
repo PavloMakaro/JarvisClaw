@@ -1,0 +1,12 @@
+{
+  "name": "datetime",
+  "description": "Utilities for getting current time, date, and weather information.",
+  "tools": [
+    "get_current_time",
+    "get_irkutsk_time",
+    "get_weather",
+    "get_current_datetime_info"
+  ],
+  "planner_visible": true,
+  "token_cost_hint": "low"
+}

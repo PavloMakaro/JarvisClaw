@@ -1,0 +1,15 @@
+python-telegram-bot[job-queue]
+requests
+yt-dlp
+openai
+beautifulsoup4
+schedule
+pydub
+watchdog
+tavily-python
+python-pptx
+opencv-python
+pandas
+openpyxl
+groq
+chromadb

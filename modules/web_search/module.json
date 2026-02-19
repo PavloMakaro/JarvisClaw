@@ -1,0 +1,10 @@
+{
+  "name": "web_search",
+  "description": "Tools for browsing the web and extracting content.",
+  "tools": [
+    "visit_page",
+    "fetch_url"
+  ],
+  "planner_visible": true,
+  "token_cost_hint": "medium"
+}
