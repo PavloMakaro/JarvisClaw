@@ -47,9 +47,6 @@ Minimze steps. If you can answer directly, do so.
         messages.append({"role": "user", "content": user_input})
 
         try:
-            # Force JSON mode if supported or just ask for JSON
-            # Note: DeepSeek might fail if tools are passed but tool_choice is confusing
-            # We don't need tools HERE, we just need JSON decision.
             response = await self.llm.generate(
                 messages,
                 provider="deepseek", # Use DeepSeek for reasoning
@@ -57,9 +54,15 @@ Minimze steps. If you can answer directly, do so.
                 tools=None # Don't pass tools to decision layer to avoid confusion/token usage
             )
 
-            content = response.content
+            # Robust content extraction
+            if hasattr(response, 'content'):
+                content = response.content
+            elif isinstance(response, dict) and 'content' in response:
+                content = response['content']
+            else:
+                content = str(response)
 
-            if "Error generating response" in content:
+            if "Error generating response" in str(content):
                  print(f"LLM Error in Decision Layer: {content}")
                  return {"decision": "RESPOND_DIRECTLY", "reasoning": "LLM Error"}
 
@@ -69,10 +72,17 @@ Minimze steps. If you can answer directly, do so.
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0].strip()
 
-            decision_data = json.loads(content)
-            return decision_data
+            # Additional cleanup for potential leading/trailing whitespace or non-json chars
+            content = content.strip()
+
+            try:
+                decision_data = json.loads(content)
+                return decision_data
+            except json.JSONDecodeError:
+                print(f"JSON Decode Error in Decision Layer. Content: {content}")
+                return {"decision": "RESPOND_DIRECTLY", "reasoning": "Invalid JSON response"}
 
         except Exception as e:
             # Fallback
             print(f"Decision error: {e}")
-            return {"decision": "RESPOND_DIRECTLY", "reasoning": "Error in decision layer"}
+            return {"decision": "RESPOND_DIRECTLY", "reasoning": f"Error in decision layer: {str(e)}"}

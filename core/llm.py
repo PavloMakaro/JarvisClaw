@@ -37,6 +37,8 @@ class LLMService:
                 client = self.deepseek_client
                 if model == "default":
                     model = "deepseek-chat"
+                elif model == "llama3-70b-8192": # If Groq default passed to DeepSeek
+                    model = "deepseek-chat"
 
             # Prepare args
             kwargs = {
