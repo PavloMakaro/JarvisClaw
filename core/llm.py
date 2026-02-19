@@ -51,6 +51,12 @@ class LLMService:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = tool_choice
 
+            # DeepSeek fix: if tools is None or empty, do NOT pass tool_choice at all
+            if not tools and "tools" in kwargs:
+                del kwargs["tools"]
+            if not tools and "tool_choice" in kwargs:
+                del kwargs["tool_choice"]
+
             if stream:
                 response = await client.chat.completions.create(**kwargs)
 
