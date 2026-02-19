@@ -82,7 +82,10 @@ class Agent:
             stream = await self.llm.generate(messages, stream=True, provider="deepseek")
 
             async for chunk in stream:
-                if hasattr(chunk, 'choices') and chunk.choices:
+                if isinstance(chunk, str):
+                    yield {"status": "final_stream", "content": chunk}
+                    final_response += chunk
+                elif hasattr(chunk, 'choices') and chunk.choices:
                     delta = chunk.choices[0].delta
                     if delta.content:
                         yield {"status": "final_stream", "content": delta.content}
@@ -110,7 +113,10 @@ class Agent:
                 stream = await self.llm.generate(messages, stream=True, provider="deepseek")
 
                 async for chunk in stream:
-                    if hasattr(chunk, 'choices') and chunk.choices:
+                    if isinstance(chunk, str):
+                        yield {"status": "final_stream", "content": chunk}
+                        final_response += chunk
+                    elif hasattr(chunk, 'choices') and chunk.choices:
                         delta = chunk.choices[0].delta
                         if delta.content:
                             yield {"status": "final_stream", "content": delta.content}
@@ -144,7 +150,10 @@ class Agent:
                 stream = await self.llm.generate(messages, stream=True, provider="deepseek")
 
                 async for chunk in stream:
-                    if hasattr(chunk, 'choices') and chunk.choices:
+                    if isinstance(chunk, str):
+                        yield {"status": "final_stream", "content": chunk}
+                        final_response += chunk
+                    elif hasattr(chunk, 'choices') and chunk.choices:
                         delta = chunk.choices[0].delta
                         if delta.content:
                             yield {"status": "final_stream", "content": delta.content}
