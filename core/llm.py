@@ -25,6 +25,7 @@ class LLMService:
         temperature: float = 0.7,
         stream: bool = False,
         tools: List[Dict[str, Any]] = None,
+        tool_choice: str = "auto",
     ) -> Union[Any, AsyncGenerator[Any, None]]:
         """
         Generates response via Groq or DeepSeek API.
@@ -37,17 +38,21 @@ class LLMService:
                 if model == "default":
                     model = "deepseek-chat"
 
-            tool_choice = "auto" if tools else None
+            # Prepare args
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "stream": stream
+            }
+
+            # Only add tools if provided and not empty
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = tool_choice
 
             if stream:
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    stream=True,
-                    tools=tools,
-                    tool_choice=tool_choice
-                )
+                response = await client.chat.completions.create(**kwargs)
 
                 # Wrap generator to yield raw chunks
                 async def stream_generator() -> AsyncGenerator[Any, None]:
@@ -57,20 +62,27 @@ class LLMService:
                 return stream_generator()
 
             else:
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    stream=False,
-                    tools=tools,
-                    tool_choice=tool_choice
-                )
+                response = await client.chat.completions.create(**kwargs)
                 return response.choices[0].message
 
         except Exception as e:
             error_msg = f"Error generating response: {str(e)}"
+
+            # Return a mock message object with error content instead of raw string
+            class ErrorMessage:
+                content = error_msg
+                tool_calls = None
+
             if stream:
-                async def error_gen() -> AsyncGenerator[str, None]:
-                    yield error_msg
+                async def error_gen() -> AsyncGenerator[Any, None]:
+                    class ErrorChunk:
+                        class Choice:
+                            class Delta:
+                                content = error_msg
+                                tool_calls = None
+                            delta = Delta()
+                        choices = [Choice()]
+                    yield ErrorChunk()
                 return error_gen()
-            return error_msg
+
+            return ErrorMessage()

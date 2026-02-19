@@ -7,9 +7,6 @@ schedule
 pydub
 watchdog
 tavily-python
-python-pptx
-opencv-python
-pandas
 openpyxl
 groq
-chromadb
+pytz

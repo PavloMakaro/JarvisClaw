@@ -41,18 +41,28 @@ Minimze steps. If you can answer directly, do so.
         ]
 
         # Add limited history context (last 3 messages)
-        messages.extend(history[-3:])
+        # Filter out system messages from history to avoid confusion
+        filtered_history = [m for m in history[-3:] if m.get("role") != "system"]
+        messages.extend(filtered_history)
         messages.append({"role": "user", "content": user_input})
 
         try:
             # Force JSON mode if supported or just ask for JSON
+            # Note: DeepSeek might fail if tools are passed but tool_choice is confusing
+            # We don't need tools HERE, we just need JSON decision.
             response = await self.llm.generate(
                 messages,
                 provider="deepseek", # Use DeepSeek for reasoning
-                stream=False
+                stream=False,
+                tools=None # Don't pass tools to decision layer to avoid confusion/token usage
             )
 
             content = response.content
+
+            if "Error generating response" in content:
+                 print(f"LLM Error in Decision Layer: {content}")
+                 return {"decision": "RESPOND_DIRECTLY", "reasoning": "LLM Error"}
+
             # Clean up markdown code blocks if present
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0].strip()

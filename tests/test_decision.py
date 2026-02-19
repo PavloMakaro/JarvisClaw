@@ -8,7 +8,7 @@ from core.decision import DecisionLayer
 
 # Mock LLM Service
 class MockLLM:
-    async def generate(self, messages, provider="deepseek", stream=False):
+    async def generate(self, messages, provider="deepseek", stream=False, tools=None):
         class Message:
             content = '{"decision": "USE_TOOL", "tool_name": "get_current_time", "tool_args": {}, "reasoning": "User asked for time"}'
         return Message()
