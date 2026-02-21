@@ -30,7 +30,7 @@ agent = Agent()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text="Hello! I am your AI assistant (V2). I am ready to help.",
+        text="Hello! I am GarvisClaw (V2). I am ready to help with complex tasks.",
     )
 
 async def clear_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -45,7 +45,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ui = TelegramUIManager(context.bot)
 
     # Send initial status
-    status_msg = await ui.send_initial_status(chat_id, "Thinking...")
+    status_msg = await ui.send_initial_status(chat_id, "🧠 Thinking...")
     if not status_msg:
         logger.error("Could not send status message.")
         return
@@ -63,47 +63,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async for update_data in agent.run(user_input, chat_id, tool_context):
             status = update_data.get("status")
 
-            if status == "thinking":
-                msg = f"Thinking: {update_data.get('message', '...')}"
-                await ui.update_status(chat_id, status_msg.message_id, msg)
-
-            elif status == "tool_use":
-                tool = update_data.get("tool")
-                msg = f"Executing: {tool}..."
-                await ui.update_status(chat_id, status_msg.message_id, msg)
-
-            elif status == "plan_created":
-                plan = update_data.get("plan")
-                steps = len(plan)
-                msg = f"Plan created ({steps} steps). Executing..."
-                await ui.update_status(chat_id, status_msg.message_id, msg)
-
-            elif status == "executing":
-                msg = f"Executing plan..."
-                await ui.update_status(chat_id, status_msg.message_id, msg)
+            # Update Reasoning Log
+            # We pass the structured data directly to the UI manager which renders it
+            if status in ["thinking", "tool_use", "plan_created", "observation"]:
+                await ui.update_status(chat_id, status_msg.message_id, update_data)
 
             elif status == "final_stream":
+                # Accumulate content
                 content = update_data.get("content")
-                final_response += content
-                # Update UI periodically with accumulated content + cursor
-                await ui.update_status(chat_id, status_msg.message_id, final_response + " ▌")
+                if content:
+                    final_response += content
 
             elif status == "final":
-                # Final content might be in 'content' if not streamed, or we use accumulated
                 if update_data.get("content"):
                     final_response = update_data.get("content")
 
-        # Send final response (overwrite status message with final text)
+        # Send final response as a NEW message, preserving the reasoning log
         if final_response:
-            await ui.send_final_response(chat_id, status_msg.message_id, final_response)
+            await ui.send_final_response(chat_id, status_msg.message_id, final_response, preserve_status=True)
         else:
-            await ui.send_final_response(chat_id, status_msg.message_id, "Error: No response generated.")
+            await ui.send_final_response(chat_id, status_msg.message_id, "Error: No response generated.", preserve_status=True)
 
     except Exception as e:
         logger.error(f"Error handling message: {e}")
-        # Try to update message with error
         try:
-            await ui.send_final_response(chat_id, status_msg.message_id, f"Error: {str(e)}")
+            await ui.send_final_response(chat_id, status_msg.message_id, f"Error: {str(e)}", preserve_status=True)
         except:
             await context.bot.send_message(chat_id=chat_id, text=f"Error: {str(e)}")
 
