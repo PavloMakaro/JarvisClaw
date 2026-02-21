@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from typing import Dict, Any, AsyncGenerator
+import json
+from typing import Dict, Any, AsyncGenerator, List
 
 from core.llm import LLMService
 from core.module_manager import ModuleManager
@@ -49,131 +50,133 @@ class Agent:
 
         # 1. Load History
         history = await self.episodic_memory.get_history(chat_id)
+        current_history = list(history) # Working copy for this session
 
         # 2. Get Tool Definitions
         tools = self.module_manager.get_definitions()
 
         yield {"status": "thinking", "message": "Analyzing request..."}
 
-        # 3. Decision Layer
-        try:
-            decision = await self.decision_layer.decide(user_input, history, tools)
-            self.logger.info(f"Decision for {chat_id}: {decision}")
-        except Exception as e:
-            self.logger.error(f"Decision failed: {e}")
-            decision = {"decision": "RESPOND_DIRECTLY"}
-
-        action = decision.get("decision")
+        loop_count = 0
+        max_loops = 20 # Safety limit, though user asked to remove strict limits, we need *some* break.
 
         final_response = ""
 
-        if action == "RESPOND_DIRECTLY":
-            yield {"status": "thinking", "message": "Drafting response..."}
-            # Generate response using LLM
-            messages = list(history)
-            messages.append({"role": "user", "content": user_input})
+        while loop_count < max_loops:
+            loop_count += 1
 
-            # Simple prompt wrapper?
-            # Or just pass messages directly
-            # We might want to inject system prompt here if not present
-            if not messages or messages[0]["role"] != "system":
-                 messages.insert(0, {"role": "system", "content": self.system_prompt})
-
-            stream = await self.llm.generate(messages, stream=True, provider="deepseek")
-
-            async for chunk in stream:
-                if isinstance(chunk, str):
-                    yield {"status": "final_stream", "content": chunk}
-                    final_response += chunk
-                elif hasattr(chunk, 'choices') and chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        yield {"status": "final_stream", "content": delta.content}
-                        final_response += delta.content
-
-        elif action == "USE_TOOL":
-            tool_name = decision.get("tool_name")
-            tool_args = decision.get("tool_args", {})
-            yield {"status": "tool_use", "tool": tool_name, "args": tool_args}
-
+            # Decision Layer
             try:
+                decision = await self.decision_layer.decide(user_input, current_history, tools)
+                self.logger.info(f"Decision for {chat_id} (Loop {loop_count}): {decision}")
+            except Exception as e:
+                self.logger.error(f"Decision failed: {e}")
+                # Fallback
+                decision = {"decision": "RESPOND_DIRECTLY"}
+
+            action = decision.get("decision")
+
+            if action == "RESPOND_DIRECTLY":
+                yield {"status": "thinking", "message": "Drafting response..."}
+
+                messages = list(current_history)
+                messages.append({"role": "user", "content": user_input})
+
+                # Add system prompt if needed
+                if not messages or messages[0]["role"] != "system":
+                     messages.insert(0, {"role": "system", "content": self.system_prompt})
+
+                stream = await self.llm.generate(messages, stream=True, provider="deepseek")
+
+                async for chunk in stream:
+                    if isinstance(chunk, str):
+                        yield {"status": "final_stream", "content": chunk}
+                        final_response += chunk
+                    elif hasattr(chunk, 'choices') and chunk.choices:
+                        delta = chunk.choices[0].delta
+                        if delta.content:
+                            yield {"status": "final_stream", "content": delta.content}
+                            final_response += delta.content
+
+                # Break loop after responding
+                break
+
+            elif action == "USE_TOOL":
+                tool_name = decision.get("tool_name")
+                tool_args = decision.get("tool_args", {})
+
+                yield {"status": "tool_use", "tool": tool_name, "args": tool_args}
+
                 # Execute tool
-                result = await self._execute_tool_safe(tool_name, tool_args, context)
+                try:
+                    result = await self._execute_tool_safe(tool_name, tool_args, context)
+                    yield {"status": "observation", "result": str(result)}
 
-                yield {"status": "observation", "result": str(result)}
+                    # Update history
+                    current_history.append({"role": "assistant", "content": f"I will use {tool_name}."})
+                    current_history.append({"role": "user", "content": f"Observation from {tool_name}: {str(result)}"})
 
-                # Generate final response with tool output
-                yield {"status": "thinking", "message": "Synthesizing answer..."}
+                    # Continue loop to see if we need more tools or response
+                    yield {"status": "thinking", "message": "Evaluating result..."}
 
-                messages = list(history)
-                messages.append({"role": "user", "content": user_input})
-                messages.append({"role": "assistant", "content": f"I will use {tool_name}."})
-                messages.append({"role": "tool", "content": str(result), "name": tool_name}) # OpenAI format roughly
+                except Exception as e:
+                    yield {"status": "error", "message": f"Tool execution failed: {e}"}
+                    # Decide whether to continue or stop? Let's stop to be safe or try to explain.
+                    final_response = f"I encountered an error executing {tool_name}: {e}"
+                    yield {"status": "final", "content": final_response}
+                    break
 
-                stream = await self.llm.generate(messages, stream=True, provider="deepseek")
+            elif action == "CREATE_PLAN":
+                yield {"status": "thinking", "message": "Creating plan..."}
 
-                async for chunk in stream:
-                    if isinstance(chunk, str):
-                        yield {"status": "final_stream", "content": chunk}
-                        final_response += chunk
-                    elif hasattr(chunk, 'choices') and chunk.choices:
-                        delta = chunk.choices[0].delta
-                        if delta.content:
-                            yield {"status": "final_stream", "content": delta.content}
-                            final_response += delta.content
+                try:
+                    plan = await self.planner.create_plan(user_input, current_history, tools)
 
-            except Exception as e:
-                final_response = f"Error executing tool {tool_name}: {e}"
+                    # Log plan
+                    plan_steps = [t.to_dict() for t in plan.tasks.values()]
+                    yield {"status": "plan_created", "plan": plan_steps}
+
+                    # Execute Plan
+                    yield {"status": "executing", "message": "Executing plan..."}
+
+                    execution_result = None
+                    async for event in self.executor.execute_graph_generator(plan, context):
+                        if event["status"] == "task_start":
+                             yield {"status": "tool_use", "tool": event["task"]["tool"], "args": event["task"]["args"]}
+                        elif event["status"] == "task_complete":
+                             yield {"status": "observation", "result": event["result"]}
+                        elif event["status"] == "plan_complete":
+                             execution_result = event["result"]
+                             yield {"status": "observation", "result": f"Plan completed. Result: {execution_result}"}
+
+                    # Update history
+                    current_history.append({"role": "assistant", "content": "I have executed the plan."})
+                    current_history.append({"role": "user", "content": f"Plan Execution Result: {execution_result}"})
+
+                    # Continue loop
+                    yield {"status": "thinking", "message": "Evaluating plan result..."}
+
+                except Exception as e:
+                    final_response = f"Planning execution failed: {e}"
+                    yield {"status": "final", "content": final_response}
+                    break
+
+            else:
+                # Unknown action
+                final_response = "I am not sure what to do."
                 yield {"status": "final", "content": final_response}
+                break
 
-        elif action == "CREATE_PLAN":
-            yield {"status": "thinking", "message": "Creating plan..."}
-
-            try:
-                plan = await self.planner.create_plan(user_input, history, tools)
-                yield {"status": "plan_created", "plan": [t.to_dict() for t in plan.tasks.values()]}
-
-                # Execute Plan
-                yield {"status": "executing", "message": "Executing plan..."}
-                execution_result = await self.executor.execute_graph(plan, context)
-
-                yield {"status": "observation", "result": str(execution_result)}
-
-                # Generate final response
-                yield {"status": "thinking", "message": "Finalizing..."}
-
-                messages = list(history)
-                messages.append({"role": "user", "content": user_input})
-                messages.append({"role": "assistant", "content": "I have executed the plan."})
-                messages.append({"role": "system", "content": f"Plan Execution Result: {execution_result}"})
-
-                stream = await self.llm.generate(messages, stream=True, provider="deepseek")
-
-                async for chunk in stream:
-                    if isinstance(chunk, str):
-                        yield {"status": "final_stream", "content": chunk}
-                        final_response += chunk
-                    elif hasattr(chunk, 'choices') and chunk.choices:
-                        delta = chunk.choices[0].delta
-                        if delta.content:
-                            yield {"status": "final_stream", "content": delta.content}
-                            final_response += delta.content
-
-            except Exception as e:
-                final_response = f"Planning failed: {e}"
-                yield {"status": "final", "content": final_response}
-
-        else:
-            final_response = "I am not sure what to do."
-            yield {"status": "final", "content": final_response}
-
-        # 4. Save Memory
+        # 4. Save Memory (at the end)
         if final_response:
             await self.episodic_memory.add_message(chat_id, "user", user_input)
             await self.episodic_memory.add_message(chat_id, "assistant", final_response)
 
-            # Optional: Add to vector memory if significant?
-            # self.vector_memory.add(f"User: {user_input}\nAssistant: {final_response}")
+            # Add to vector memory (LanceDB)
+            try:
+                self.vector_memory.add(f"User: {user_input}\nAssistant: {final_response}")
+            except Exception as e:
+                self.logger.warning(f"Failed to add to vector memory: {e}")
 
         yield {"status": "final", "content": final_response}
 
