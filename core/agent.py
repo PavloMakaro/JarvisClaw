@@ -1,12 +1,13 @@
 import asyncio
 import logging
-from typing import Dict, Any, AsyncGenerator
+import json
+from typing import Dict, Any, AsyncGenerator, List
 
 from core.llm import LLMService
 from core.module_manager import ModuleManager
 from core.memory.vector_memory import VectorMemory
 from core.memory.episodic_memory import EpisodicMemory
-from core.decision import DecisionLayer
+# from core.decision import DecisionLayer # Removed, integrated into loop
 from core.planner import Planner
 from core.executor import Executor
 
@@ -21,14 +22,20 @@ class Agent:
         self.vector_memory = VectorMemory()
         self.episodic_memory = EpisodicMemory()
 
-        self.decision_layer = DecisionLayer(self.llm)
+        # self.decision_layer = DecisionLayer(self.llm) # Deprecated
         self.planner = Planner(self.llm)
         self.executor = Executor(self.module_manager)
 
         self.logger = logging.getLogger("Agent")
 
         # Load system prompt
-        self.system_prompt = "You are a helpful AI assistant."
+        self.system_prompt = (
+            "You are GarvisClaw, an advanced AI agent. "
+            "You have access to tools and a planning module. "
+            "When solving complex tasks, first create a plan using 'create_plan'. "
+            "Think step-by-step. "
+            "Output your reasoning before taking actions."
+        )
         try:
             if os.path.exists("system_prompt.txt"):
                 with open("system_prompt.txt", "r", encoding="utf-8") as f:
@@ -41,7 +48,7 @@ class Agent:
 
     async def run(self, user_input: str, chat_id: str, context: Dict[str, Any] = None) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Main execution loop.
+        Main execution loop (ReAct style).
         Yields status updates and final response.
         """
         if context is None:
@@ -51,134 +58,208 @@ class Agent:
         history = await self.episodic_memory.get_history(chat_id)
 
         # 2. Get Tool Definitions
-        tools = self.module_manager.get_definitions()
+        tools_definitions = self.module_manager.get_definitions()
 
-        yield {"status": "thinking", "message": "Analyzing request..."}
+        # Ensure correct OpenAI format
+        formatted_tools = []
+        for t in tools_definitions:
+            if "type" not in t:
+                formatted_tools.append({"type": "function", "function": t})
+            else:
+                formatted_tools.append(t)
 
-        # 3. Decision Layer
-        try:
-            decision = await self.decision_layer.decide(user_input, history, tools)
-            self.logger.info(f"Decision for {chat_id}: {decision}")
-        except Exception as e:
-            self.logger.error(f"Decision failed: {e}")
-            decision = {"decision": "RESPOND_DIRECTLY"}
+        # Add Planner Tool definition manually if not present
+        # (Assuming Planner isn't in ModuleManager yet, or if it is, this duplicates but that's ok to check)
+        # Actually, let's just rely on ModuleManager tools, but if we want explicit planning:
+        # We can implement 'create_plan' handling inside the tool execution block.
+        # Let's add it to formatted_tools explicitly.
 
-        action = decision.get("decision")
+        plan_tool_def = {
+            "type": "function",
+            "function": {
+                "name": "create_plan",
+                "description": "Create a step-by-step execution plan for complex tasks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string", "description": "Description of the task to plan for."}
+                    },
+                    "required": ["description"]
+                }
+            }
+        }
+        # Check if already exists
+        if not any(t["function"]["name"] == "create_plan" for t in formatted_tools):
+            formatted_tools.append(plan_tool_def)
 
-        final_response = ""
+        # 3. Initial Messages
+        # Ensure system prompt is first for caching
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_input})
 
-        if action == "RESPOND_DIRECTLY":
-            yield {"status": "thinking", "message": "Drafting response..."}
-            # Generate response using LLM
-            messages = list(history)
-            messages.append({"role": "user", "content": user_input})
+        step = 0
+        max_steps = 30 # Safety limit
 
-            # Simple prompt wrapper?
-            # Or just pass messages directly
-            # We might want to inject system prompt here if not present
-            if not messages or messages[0]["role"] != "system":
-                 messages.insert(0, {"role": "system", "content": self.system_prompt})
+        while step < max_steps:
+            step += 1
+            yield {"status": "thinking", "step": step}
 
-            stream = await self.llm.generate(messages, stream=True, provider="deepseek")
+            # Call LLM with Streaming
+            response_content = ""
+            tool_calls_buffer = [] # To reconstruct tool calls from chunks
 
-            async for chunk in stream:
-                if isinstance(chunk, str):
-                    yield {"status": "final_stream", "content": chunk}
-                    final_response += chunk
-                elif hasattr(chunk, 'choices') and chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        yield {"status": "final_stream", "content": delta.content}
-                        final_response += delta.content
-
-        elif action == "USE_TOOL":
-            tool_name = decision.get("tool_name")
-            tool_args = decision.get("tool_args", {})
-            yield {"status": "tool_use", "tool": tool_name, "args": tool_args}
-
+            # We need to handle the stream carefully
+            # The LLMService.generate returns a generator
             try:
-                # Execute tool
-                result = await self._execute_tool_safe(tool_name, tool_args, context)
+                stream = await self.llm.generate(messages, tools=formatted_tools, stream=True, provider="deepseek")
 
-                yield {"status": "observation", "result": str(result)}
-
-                # Generate final response with tool output
-                yield {"status": "thinking", "message": "Synthesizing answer..."}
-
-                messages = list(history)
-                messages.append({"role": "user", "content": user_input})
-                messages.append({"role": "assistant", "content": f"I will use {tool_name}."})
-                messages.append({"role": "tool", "content": str(result), "name": tool_name}) # OpenAI format roughly
-
-                stream = await self.llm.generate(messages, stream=True, provider="deepseek")
+                # State for tool call reconstruction
+                current_tool_index = -1
 
                 async for chunk in stream:
+                    # Error handling (string error)
                     if isinstance(chunk, str):
-                        yield {"status": "final_stream", "content": chunk}
-                        final_response += chunk
-                    elif hasattr(chunk, 'choices') and chunk.choices:
+                        # This usually means an error occurred in LLMService
+                        yield {"status": "final", "content": chunk}
+                        return
+
+                    if hasattr(chunk, 'choices') and chunk.choices:
                         delta = chunk.choices[0].delta
+
+                        # 1. Content (Reasoning/Thought)
                         if delta.content:
-                            yield {"status": "final_stream", "content": delta.content}
-                            final_response += delta.content
+                            response_content += delta.content
+                            yield {"status": "thinking", "thought": response_content, "step": step}
+
+                        # 2. Tool Calls
+                        if delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                if tc.index is not None and tc.index != current_tool_index:
+                                    # New tool call started
+                                    current_tool_index = tc.index
+                                    tool_calls_buffer.append({
+                                        "id": tc.id or "",
+                                        "type": "function",
+                                        "function": {"name": tc.function.name or "", "arguments": tc.function.arguments or ""}
+                                    })
+                                else:
+                                    # Append to current tool call
+                                    if current_tool_index >= 0 and current_tool_index < len(tool_calls_buffer):
+                                        if tc.function.name:
+                                            tool_calls_buffer[current_tool_index]["function"]["name"] += tc.function.name
+                                        if tc.function.arguments:
+                                            tool_calls_buffer[current_tool_index]["function"]["arguments"] += tc.function.arguments
 
             except Exception as e:
-                final_response = f"Error executing tool {tool_name}: {e}"
-                yield {"status": "final", "content": final_response}
+                self.logger.error(f"LLM Generation failed: {e}")
+                yield {"status": "final", "content": f"Error: {e}"}
+                return
 
-        elif action == "CREATE_PLAN":
-            yield {"status": "thinking", "message": "Creating plan..."}
+            # Analyze Result
+            # If no tool calls and we have content, it's likely the final answer or a question.
+            # But we must check if the model intended to stop.
 
-            try:
-                plan = await self.planner.create_plan(user_input, history, tools)
-                yield {"status": "plan_created", "plan": [t.to_dict() for t in plan.tasks.values()]}
+            # If we have tool calls, execute them.
+            if tool_calls_buffer:
+                # Add Assistant Message with Tool Calls to history
+                # We need to construct the full assistant message object
+                # DeepSeek/OpenAI expects the 'tool_calls' field
 
-                # Execute Plan
-                yield {"status": "executing", "message": "Executing plan..."}
-                execution_result = await self.executor.execute_graph(plan, context)
+                # Fix up tool calls (arguments are strings, need parse?)
+                # Actually, for the history, we keep them as objects/dicts
 
-                yield {"status": "observation", "result": str(execution_result)}
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": response_content,
+                    "tool_calls": tool_calls_buffer
+                }
+                messages.append(assistant_msg)
 
-                # Generate final response
-                yield {"status": "thinking", "message": "Finalizing..."}
+                # Execute each tool
+                for tc in tool_calls_buffer:
+                    func_name = tc["function"]["name"]
+                    args_str = tc["function"]["arguments"]
+                    call_id = tc["id"] or "call_" + func_name
 
-                messages = list(history)
-                messages.append({"role": "user", "content": user_input})
-                messages.append({"role": "assistant", "content": "I have executed the plan."})
-                messages.append({"role": "system", "content": f"Plan Execution Result: {execution_result}"})
+                    try:
+                        args = json.loads(args_str)
+                    except:
+                        args = {} # Error parsing args
 
-                stream = await self.llm.generate(messages, stream=True, provider="deepseek")
+                    yield {"status": "tool_use", "tool_call": {"name": func_name, "args": args}}
 
-                async for chunk in stream:
-                    if isinstance(chunk, str):
-                        yield {"status": "final_stream", "content": chunk}
-                        final_response += chunk
-                    elif hasattr(chunk, 'choices') and chunk.choices:
-                        delta = chunk.choices[0].delta
-                        if delta.content:
-                            yield {"status": "final_stream", "content": delta.content}
-                            final_response += delta.content
+                    # SPECIAL HANDLING: create_plan
+                    if func_name == "create_plan":
+                        # Call planner
+                        try:
+                            # Planner.create_plan expects (user_input, history, tools)
+                            # But here we are in a loop. We might just use the args description.
+                            plan_desc = args.get("description", user_input)
 
-            except Exception as e:
-                final_response = f"Planning failed: {e}"
-                yield {"status": "final", "content": final_response}
+                            # Using the existing Planner logic
+                            # We need to adapt it.
+                            # Let's just create a new plan based on the description
+                            # The Planner class currently uses LLM to generate a plan.
+                            plan_graph = await self.planner.create_plan(plan_desc, history, tools_definitions)
 
-        else:
-            final_response = "I am not sure what to do."
-            yield {"status": "final", "content": final_response}
+                            plan_data = [t.to_dict() for t in plan_graph.tasks.values()]
+                            result_str = f"Plan created with {len(plan_data)} steps."
 
-        # 4. Save Memory
-        if final_response:
-            await self.episodic_memory.add_message(chat_id, "user", user_input)
-            await self.episodic_memory.add_message(chat_id, "assistant", final_response)
+                            yield {"status": "plan_created", "plan": plan_data}
 
-            # Optional: Add to vector memory if significant?
-            # self.vector_memory.add(f"User: {user_input}\nAssistant: {final_response}")
+                            # Optionally execute the plan automatically?
+                            # The user said "make AI determine steps".
+                            # If we have a plan, maybe we just return it as observation?
+                            # Or we can use `executor` to run it?
+                            # Let's return it as observation so the Agent knows the plan exists.
+                            result_str = json.dumps(plan_data)
 
-        yield {"status": "final", "content": final_response}
+                        except Exception as e:
+                            result_str = f"Planning Error: {e}"
+
+                    else:
+                        # Standard Tool
+                        try:
+                            result = await self._execute_tool_safe(func_name, args, context)
+                            result_str = str(result)
+                        except Exception as e:
+                            result_str = f"Error: {e}"
+
+                    yield {"status": "observation", "observation": result_str}
+
+                    # Append Tool Output to messages
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id, # Must match
+                        "name": func_name,
+                        "content": result_str
+                    })
+
+                # Loop continues to next step (Agent reflects on Tool Outputs)
+
+            else:
+                # No tool calls. This is the Final Answer.
+                yield {"status": "final_stream", "content": response_content} # It was already streamed as 'thought' effectively, but let's signal finality.
+
+                # Wait, if response_content was just "I will check..." and then no tool call?
+                # That happens if model fails to call tool.
+                # But if it's "The answer is 42", we are done.
+
+                # We yield 'final' with the full content to ensure UI knows we are done.
+                yield {"status": "final", "content": response_content}
+
+                # Save to memory
+                await self.episodic_memory.add_message(chat_id, "user", user_input)
+                await self.episodic_memory.add_message(chat_id, "assistant", response_content)
+                break
 
     async def _execute_tool_safe(self, tool_name, args, context):
         """Executes a tool handling async/sync and errors."""
+        # Check if tool exists in module manager
+        if tool_name not in self.module_manager.tools:
+            return f"Tool {tool_name} not found."
+
         is_async = self.module_manager.tool_metadata.get(tool_name, {}).get("is_async", False)
 
         if is_async:

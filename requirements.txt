@@ -12,4 +12,6 @@ opencv-python
 pandas
 openpyxl
 groq
-chromadb
+lancedb
+tqdm
+sentence-transformers

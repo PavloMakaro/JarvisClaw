@@ -1,70 +1,74 @@
+import lancedb
+from lancedb.embeddings import get_registry
+from lancedb.pydantic import LanceModel, Vector
+import logging
 import json
 import os
-import math
-import re
 
 class VectorMemory:
-    def __init__(self, storage_file="data/vector_memory.json"):
-        self.storage_file = storage_file
-        self.memory = []
-        self._load()
+    def __init__(self, storage_path="data/lancedb", table_name="memory"):
+        self.logger = logging.getLogger("VectorMemory")
+        self.storage_path = storage_path
+        self.table_name = table_name
 
-    def _load(self):
-        if os.path.exists(self.storage_file):
-            try:
-                with open(self.storage_file, "r", encoding="utf-8") as f:
-                    self.memory = json.load(f)
-            except:
-                self.memory = []
+        # Ensure directory exists
+        os.makedirs(storage_path, exist_ok=True)
+
+        # Initialize Embedding Function (using sentence-transformers)
+        # This will download the model on first use if not present
+        self.func = get_registry().get("sentence-transformers").create(name="all-MiniLM-L6-v2")
+
+        # Define Schema dynamically to bind the function
+        class MemoryItem(LanceModel):
+            text: str = self.func.SourceField()
+            vector: Vector(self.func.ndims()) = self.func.VectorField()
+            metadata: str # Store as JSON string
+
+        self.schema = MemoryItem
+
+        # Connect to DB
+        self.db = lancedb.connect(self.storage_path)
+
+        # Open or Create Table
+        if self.table_name in self.db.table_names():
+            self.table = self.db.open_table(self.table_name)
         else:
-            self.memory = []
+            self.table = self.db.create_table(self.table_name, schema=self.schema)
 
-    def _save(self):
-        # ensure dir exists
-        os.makedirs(os.path.dirname(self.storage_file), exist_ok=True)
-        with open(self.storage_file, "w", encoding="utf-8") as f:
-            json.dump(self.memory, f, ensure_ascii=False, indent=2)
-
-    def add(self, text, metadata=None):
-        """Adds a memory item."""
+    def add(self, text: str, metadata: dict = None):
+        """Adds a text item to the vector store."""
         if not text:
             return
 
-        entry = {
-            "text": text,
-            "metadata": metadata or {},
-            "timestamp": None # Add timestamp if needed
-        }
-        self.memory.append(entry)
-        self._save()
+        meta_str = json.dumps(metadata or {})
 
-    def search(self, query, k=3):
-        """
-        Simulates vector search using keyword overlap / simple scoring.
-        Returns top k results.
-        """
-        if not self.memory:
+        # The embedding function automatically handles vectorization of 'text'
+        self.table.add([{"text": text, "metadata": meta_str}])
+        self.logger.info(f"Added to memory: {text[:50]}...")
+
+    def search(self, query: str, k: int = 3):
+        """Searches for similar items."""
+        if not query:
             return []
 
-        query_tokens = set(re.findall(r"\w+", query.lower()))
-        results = []
+        try:
+            results = self.table.search(query).limit(k).to_list()
 
-        for item in self.memory:
-            text = item["text"]
-            text_tokens = set(re.findall(r"\w+", text.lower()))
+            parsed_results = []
+            for r in results:
+                try:
+                    meta = json.loads(r["metadata"])
+                except:
+                    meta = {}
 
-            if not text_tokens:
-                score = 0
-            else:
-                # Jaccard similarity as a proxy for semantic relevance
-                intersection = query_tokens.intersection(text_tokens)
-                union = query_tokens.union(text_tokens)
-                score = len(intersection) / len(union) if union else 0
-
-            if score > 0:
-                results.append((score, item))
-
-        # Sort by score desc
-        results.sort(key=lambda x: x[0], reverse=True)
-
-        return [r[1] for r in results[:k]]
+                # LanceDB search returns items. Distance might be available depending on query type.
+                # Usually it's in _distance if metric is set, but let's just return the item.
+                parsed_results.append({
+                    "text": r["text"],
+                    "metadata": meta,
+                    "score": r.get("_distance", 0.0)
+                })
+            return parsed_results
+        except Exception as e:
+            self.logger.error(f"Search failed: {e}")
+            return []
