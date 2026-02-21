@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 import config
 from core.agent import Agent
-from core.ui.telegram_ui import TelegramUIManager
+from core.ui.display import TelegramRenderer
 
 # Enable logging
 logging.basicConfig(
@@ -42,13 +42,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text
     chat_id = str(update.effective_chat.id)
 
-    ui = TelegramUIManager(context.bot)
-
-    # Send initial status
-    status_msg = await ui.send_initial_status(chat_id, "Thinking...")
-    if not status_msg:
-        logger.error("Could not send status message.")
-        return
+    # Use new Renderer
+    renderer = TelegramRenderer(context.bot, chat_id)
+    await renderer.start("Analyzing request...")
 
     # Prepare context for tools
     tool_context = {
@@ -58,52 +54,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     final_response = ""
+    last_tool_msg = ""
 
     try:
         async for update_data in agent.run(user_input, chat_id, tool_context):
             status = update_data.get("status")
 
             if status == "thinking":
-                msg = f"Thinking: {update_data.get('message', '...')}"
-                await ui.update_status(chat_id, status_msg.message_id, msg)
-
-            elif status == "tool_use":
-                tool = update_data.get("tool")
-                msg = f"Executing: {tool}..."
-                await ui.update_status(chat_id, status_msg.message_id, msg)
+                msg = update_data.get("message", "Thinking...")
+                await renderer.log_step(msg, "running")
 
             elif status == "plan_created":
                 plan = update_data.get("plan")
-                steps = len(plan)
-                msg = f"Plan created ({steps} steps). Executing..."
-                await ui.update_status(chat_id, status_msg.message_id, msg)
+                plan_text = "\n".join([f"- {t['tool']}" for t in plan])
+                await renderer.append_log(f"📋 **Plan Created:**\n{plan_text}")
+
+            elif status == "tool_use":
+                tool = update_data.get("tool")
+                last_tool_msg = f"Executing {tool}..."
+                await renderer.log_step(last_tool_msg, "running")
+
+            elif status == "observation":
+                result = update_data.get("result")
+                short_result = (str(result)[:100] + "...") if len(str(result)) > 100 else str(result)
+                # Mark previous running step as done
+                await renderer.update_last_log(f"✅ {last_tool_msg} (Result: {short_result})")
 
             elif status == "executing":
-                msg = f"Executing plan..."
-                await ui.update_status(chat_id, status_msg.message_id, msg)
+                msg = update_data.get("message", "Executing...")
+                await renderer.log_step(msg, "running")
 
             elif status == "final_stream":
                 content = update_data.get("content")
                 final_response += content
-                # Update UI periodically with accumulated content + cursor
-                await ui.update_status(chat_id, status_msg.message_id, final_response + " ▌")
+                # We don't stream to log, we wait for finish
 
             elif status == "final":
-                # Final content might be in 'content' if not streamed, or we use accumulated
                 if update_data.get("content"):
                     final_response = update_data.get("content")
 
-        # Send final response (overwrite status message with final text)
+            elif status == "error":
+                error_msg = update_data.get("message")
+                await renderer.append_log(f"❌ Error: {error_msg}")
+
+        # Send final response
         if final_response:
-            await ui.send_final_response(chat_id, status_msg.message_id, final_response)
+            await renderer.finish(final_response)
         else:
-            await ui.send_final_response(chat_id, status_msg.message_id, "Error: No response generated.")
+            await renderer.finish("I'm done, but I have no response.")
 
     except Exception as e:
         logger.error(f"Error handling message: {e}")
-        # Try to update message with error
         try:
-            await ui.send_final_response(chat_id, status_msg.message_id, f"Error: {str(e)}")
+            await renderer.finish(f"Error: {str(e)}")
         except:
             await context.bot.send_message(chat_id=chat_id, text=f"Error: {str(e)}")
 

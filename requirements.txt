@@ -12,4 +12,7 @@ opencv-python
 pandas
 openpyxl
 groq
-chromadb
+lancedb
+sentence-transformers
+aiohttp
+pytz

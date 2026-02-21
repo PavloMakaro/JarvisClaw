@@ -1,4 +1,5 @@
 import asyncio
+from typing import AsyncGenerator, Dict, Any
 from core.task_graph import TaskGraph, TaskStatus
 from core.module_manager import ModuleManager
 
@@ -10,13 +11,35 @@ class Executor:
         """
         Executes the task graph until completion or failure.
         Returns the result of the last completed task.
+        Legacy method for backward compatibility.
+        """
+        last_result = None
+        async for event in self.execute_graph_generator(graph, context):
+            if event["status"] == "task_complete":
+                last_result = event["result"]
+            elif event["status"] == "error":
+                return event["message"]
+        return last_result
+
+    async def execute_graph_generator(self, graph: TaskGraph, context: dict = None) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Executes the task graph and yields events.
+        Events:
+        - {"status": "task_start", "task": task_obj}
+        - {"status": "task_complete", "task": task_obj, "result": result}
+        - {"status": "task_failed", "task": task_obj, "error": error}
+        - {"status": "plan_complete", "result": final_result}
         """
         if not context:
             context = {}
 
         results = {} # task_id -> result
 
-        while not graph.is_complete():
+        loop_count = 0
+        max_loops = 50 # Safety break
+
+        while not graph.is_complete() and loop_count < max_loops:
+            loop_count += 1
             ready_tasks = graph.get_ready_tasks()
 
             if not ready_tasks:
@@ -24,23 +47,16 @@ class Executor:
                 if all(t.status in [TaskStatus.COMPLETED, TaskStatus.FAILED] for t in graph.tasks.values()):
                     break
                 else:
-                    return "Error: Plan stalled (dependency loop or failure)."
+                    yield {"status": "error", "message": "Plan stalled (dependency loop or failure)."}
+                    return
 
-            # Execute ready tasks (could be parallelized)
+            # Execute ready tasks (sequentially for now to keep generator simple)
             for task in ready_tasks:
                 task.status = TaskStatus.RUNNING
+                yield {"status": "task_start", "task": task.to_dict()}
 
-                # Resolve arguments (replace placeholders if any)
-                # Simple logic: If an argument is a string starting with '$', look up dependency result
-                # Ideally, the planner should handle this via specific syntax, but let's keep it simple.
-                # Or, we just pass the previous results in context?
-
-                # For now, pass all previous results in a special arg if tool supports it?
-                # Better: Update args with dependency results if explicitly referenced?
-
-                # Simple implementation: Just execute.
-
-                print(f"Executing task {task.id}: {task.tool} args={task.args}")
+                # Resolve arguments
+                # (Simple arg resolution could be added here if needed)
 
                 try:
                     # Check if async
@@ -55,15 +71,17 @@ class Executor:
 
                     graph.mark_completed(task.id, result)
                     results[task.id] = result
+                    yield {"status": "task_complete", "task": task.to_dict(), "result": str(result)}
 
                 except Exception as e:
                     graph.mark_failed(task.id, str(e))
-                    return f"Task {task.id} ({task.tool}) failed: {e}"
+                    yield {"status": "task_failed", "task": task.to_dict(), "error": str(e)}
+                    # Continue or break? Usually break on failure unless handled
+                    # For now, let's continue if possible, but usually dependency checks will stop subsequent tasks.
 
-        # Return the result of the last task (or all results?)
-        # Usually the last added task is the goal.
-        # Let's find the task with no dependents? or simply the last one by ID logic?
-        # We'll return the last executed result.
+        # Return the result of the last task
         if results:
-            return list(results.values())[-1]
-        return "No tasks executed."
+            final_result = list(results.values())[-1]
+            yield {"status": "plan_complete", "result": final_result}
+        else:
+            yield {"status": "plan_complete", "result": "No tasks executed."}
